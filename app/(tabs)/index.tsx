@@ -1,4 +1,3 @@
-import AsyncStorage from "@react-native-async-storage/async-storage";
 import React, { useEffect, useState } from "react";
 import {
   ImageBackground,
@@ -10,9 +9,7 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
-
-const STORAGE_KEY = "mb_bookings_v1_saved";
-const LANGUAGE_KEY = "mb_bookings_language";
+import { supabase } from "../../lib/supabase";
 
 const OPTIONS = {
   bookingSource: ["Private Booking", "Booking Agent"],
@@ -153,6 +150,7 @@ function parseDisplayDate(dateString: string) {
 }
 
 function isBookingThisWeek(booking: Booking) {
+  console.log("BOOKING CHECK", booking);
   const bookingDate = parseDisplayDate(booking.date);
   if (!bookingDate) return false;
 
@@ -181,6 +179,47 @@ function sortBookingsByDate(bookings: Booking[]) {
 
     return dateA.getTime() - dateB.getTime();
   });
+}
+
+function rowToBooking(row: any): Booking {
+  return {
+    id: row.id,
+    bookingSource: row.booking_source || "Private Booking",
+    agentName: row.agent_name || "",
+    clientName: row.client_name || "",
+    contactNumber: row.contact_number || "",
+    contactHandle: row.contact_handle || "",
+    eventType: row.event_type || "BBQ",
+    bbqPackage: row.bbq_package || "",
+    date: row.event_date || "",
+    time: row.event_time || "",
+    guests: row.guests || "",
+    location: row.location || "",
+    staffRequired: Array.isArray(row.staff_required) ? row.staff_required : [],
+    equipmentRequired: Array.isArray(row.equipment_required) ? row.equipment_required : [],
+    notes: row.notes || "",
+    status: row.status || "Deposit Paid",
+  };
+}
+
+function bookingToRow(booking: typeof emptyForm) {
+  return {
+    booking_source: booking.bookingSource,
+    agent_name: booking.bookingSource === "Booking Agent" ? booking.agentName : "",
+    client_name: booking.clientName.trim(),
+    contact_number: booking.contactNumber.trim(),
+    contact_handle: booking.contactHandle.trim(),
+    event_type: booking.eventType,
+    bbq_package: booking.eventType === "BBQ" ? booking.bbqPackage : "",
+    event_date: booking.date.trim(),
+    event_time: booking.time.trim(),
+    guests: booking.guests.trim(),
+    location: booking.location.trim(),
+    staff_required: booking.staffRequired || [],
+    equipment_required: booking.equipmentRequired || [],
+    notes: booking.notes.trim(),
+    status: booking.status,
+  };
 }
 
 function PageShell({ children }: { children: React.ReactNode }) {
@@ -285,27 +324,48 @@ export default function HomeScreen() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [selectedBooking, setSelectedBooking] = useState<Booking | null>(null);
   const [lang, setLang] = useState<Lang>("en");
+  const [loading, setLoading] = useState(false);
+  const [errorMessage, setErrorMessage] = useState("");
 
   const text = T[lang];
 
   useEffect(() => {
-    loadData();
+    loadBookings();
+
+    const channel = supabase
+      .channel("bookings-live")
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "bookings" },
+        () => {
+          loadBookings();
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
   }, []);
 
-  useEffect(() => {
-    AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(bookings));
-  }, [bookings]);
+  const loadBookings = async () => {
+    setLoading(true);
+    setErrorMessage("");
 
-  useEffect(() => {
-    AsyncStorage.setItem(LANGUAGE_KEY, lang);
-  }, [lang]);
+    const { data, error } = await supabase
+      .from("bookings")
+      .select("*")
+      .order("created_at", { ascending: true });
 
-  const loadData = async () => {
-    const savedBookings = await AsyncStorage.getItem(STORAGE_KEY);
-    const savedLang = await AsyncStorage.getItem(LANGUAGE_KEY);
+    if (error) {
+      console.log("Load bookings error:", error);
+      setErrorMessage(error.message);
+      setLoading(false);
+      return;
+    }
 
-    if (savedBookings) setBookings(JSON.parse(savedBookings));
-    if (savedLang === "en" || savedLang === "pt") setLang(savedLang);
+    setBookings((data || []).map(rowToBooking));
+    setLoading(false);
   };
 
   const sortedBookings = sortBookingsByDate(bookings);
@@ -335,39 +395,54 @@ export default function HomeScreen() {
     setEditingId(null);
   };
 
-  const saveBooking = () => {
+  const saveBooking = async () => {
     if (!form.clientName.trim()) return;
     if (!form.date.trim()) return;
 
-    const cleanedForm = {
-      ...form,
-      clientName: form.clientName.trim(),
-      contactNumber: form.contactNumber.trim(),
-      contactHandle: form.contactHandle.trim(),
-      date: form.date.trim(),
-      time: form.time.trim(),
-      guests: form.guests.trim(),
-      location: form.location.trim(),
-      notes: form.notes.trim(),
-      agentName: form.bookingSource === "Booking Agent" ? form.agentName : "",
-      bbqPackage: form.eventType === "BBQ" ? form.bbqPackage : "",
-    };
+    setLoading(true);
+    setErrorMessage("");
+
+    const row = bookingToRow(form);
 
     if (editingId) {
-      setBookings((previous) =>
-        previous.map((booking) =>
-          booking.id === editingId ? { ...cleanedForm, id: editingId } : booking
-        )
-      );
-      setSelectedBooking({ ...cleanedForm, id: editingId });
+      const { error } = await supabase
+        .from("bookings")
+        .update(row)
+        .eq("id", editingId);
+
+      if (error) {
+        console.log("Update booking error:", error);
+        setErrorMessage(error.message);
+        setLoading(false);
+        return;
+      }
+
+      await loadBookings();
+
+      const updatedBooking: Booking = { ...form, id: editingId };
+      setSelectedBooking(updatedBooking);
     } else {
-      const newBooking = { ...cleanedForm, id: Date.now().toString() };
+      const { data, error } = await supabase
+        .from("bookings")
+        .insert([row])
+        .select()
+        .single();
+
+      if (error) {
+        console.log("Insert booking error:", error);
+        setErrorMessage(error.message);
+        setLoading(false);
+        return;
+      }
+
+      const newBooking = rowToBooking(data);
       setBookings((previous) => [...previous, newBooking]);
       setSelectedBooking(newBooking);
     }
 
     resetForm();
     setScreen("week");
+    setLoading(false);
   };
 
   const openBooking = (booking: Booking) => {
@@ -387,7 +462,22 @@ export default function HomeScreen() {
     setScreen("add");
   };
 
-  const markCompleted = (id: string) => {
+  const markCompleted = async (id: string) => {
+    setLoading(true);
+    setErrorMessage("");
+
+    const { error } = await supabase
+      .from("bookings")
+      .update({ status: "Completed" })
+      .eq("id", id);
+
+    if (error) {
+      console.log("Complete booking error:", error);
+      setErrorMessage(error.message);
+      setLoading(false);
+      return;
+    }
+
     setBookings((previous) =>
       previous.map((booking) =>
         booking.id === id ? { ...booking, status: "Completed" } : booking
@@ -397,15 +487,34 @@ export default function HomeScreen() {
     setSelectedBooking((previous) =>
       previous && previous.id === id ? { ...previous, status: "Completed" } : previous
     );
+
+    setLoading(false);
   };
 
-  const deleteBooking = (id: string) => {
+  const deleteBooking = async (id: string) => {
+    setLoading(true);
+    setErrorMessage("");
+
+    const { error } = await supabase
+      .from("bookings")
+      .delete()
+      .eq("id", id);
+
+    if (error) {
+      console.log("Delete booking error:", error);
+      setErrorMessage(error.message);
+      setLoading(false);
+      return;
+    }
+
     setBookings((previous) => previous.filter((booking) => booking.id !== id));
 
     if (selectedBooking?.id === id) {
       setSelectedBooking(null);
       setScreen("week");
     }
+
+    setLoading(false);
   };
 
   const BookingCard = ({ booking }: { booking: Booking }) => (
@@ -459,6 +568,13 @@ export default function HomeScreen() {
     </TouchableOpacity>
   );
 
+  const StatusLine = () => (
+    <>
+      {loading && <Text style={styles.statusMessage}>Loading...</Text>}
+      {!!errorMessage && <Text style={styles.errorMessage}>{errorMessage}</Text>}
+    </>
+  );
+
   return (
     <View style={styles.app}>
       {screen === "week" && (
@@ -468,6 +584,7 @@ export default function HomeScreen() {
             contentContainerStyle={styles.scrollContent}
             keyboardShouldPersistTaps="handled"
           >
+            <StatusLine />
             {thisWeekBookings.length === 0 ? (
               <Text style={styles.emptyText}>{text.noWeek}</Text>
             ) : (
@@ -486,6 +603,7 @@ export default function HomeScreen() {
             contentContainerStyle={styles.scrollContent}
             keyboardShouldPersistTaps="handled"
           >
+            <StatusLine />
             <Text style={styles.pageTitle}>{text.allBookings}</Text>
 
             {sortedBookings.length === 0 ? (
@@ -502,6 +620,7 @@ export default function HomeScreen() {
       {screen === "details" && selectedBooking && (
         <PageShell>
           <ScrollView style={styles.scrollView} contentContainerStyle={styles.scrollContent}>
+            <StatusLine />
             <Text style={styles.pageTitle}>{text.bookingDetails}</Text>
 
             <View style={styles.detailsCard}>
@@ -557,6 +676,7 @@ export default function HomeScreen() {
             contentContainerStyle={styles.formContent}
             keyboardShouldPersistTaps="handled"
           >
+            <StatusLine />
             <Text style={styles.pageTitle}>
               {editingId ? text.editBooking : text.addBooking}
             </Text>
@@ -678,6 +798,7 @@ export default function HomeScreen() {
       {screen === "settings" && (
         <PageShell>
           <View style={styles.settingsBox}>
+            <StatusLine />
             <Text style={styles.pageTitle}>{text.settings}</Text>
 
             <OptionButtons
@@ -770,6 +891,21 @@ const styles = StyleSheet.create({
     fontSize: 17,
     fontWeight: "800",
     marginTop: 0,
+  },
+
+  statusMessage: {
+    textAlign: "center",
+    fontSize: 14,
+    fontWeight: "800",
+    marginBottom: 8,
+  },
+
+  errorMessage: {
+    textAlign: "center",
+    fontSize: 14,
+    fontWeight: "800",
+    color: "#8B0000",
+    marginBottom: 8,
   },
 
   fieldBlock: {
